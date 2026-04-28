@@ -1,6 +1,7 @@
-import { Controller, Post, Get, Body, Param, UseInterceptors, UploadedFile, UseGuards } from '@nestjs/common';
+// modules/ai/ai.controller.ts
+import { Controller, Post, Get, Body, Param, UseInterceptors, UploadedFile, UseGuards, Query } from '@nestjs/common';
 import { FileInterceptor } from '@nestjs/platform-express';
-import { AiService } from './ai.service';
+import { AiService, ProcessedReceiptResult } from './ai.service';
 import { Roles } from '../../common/decorators/roles.decorator';
 import { RolesGuard } from '../../common/guards/roles.guard';
 import { UserRole } from '../../common/interfaces/user.interface';
@@ -10,6 +11,17 @@ import { UserRole } from '../../common/interfaces/user.interface';
 export class AiController {
   constructor(private readonly aiService: AiService) {}
   
+  @Post('process-receipt')
+  @Roles(UserRole.USER, UserRole.GOVERNMENT, UserRole.ADMIN)
+  @UseInterceptors(FileInterceptor('receipt'))
+  async processReceipt(
+    @UploadedFile() file: Express.Multer.File,
+    @Body('companyId') companyId?: string,
+  ): Promise<ProcessedReceiptResult> {
+    return this.aiService.processReceiptWithGemini(file, companyId);
+  }
+  
+  // Keep existing methods...
   @Post('scan-document')
   @Roles(UserRole.GOVERNMENT, UserRole.ADMIN)
   @UseInterceptors(FileInterceptor('document'))
@@ -27,13 +39,5 @@ export class AiController {
   @Roles(UserRole.GOVERNMENT, UserRole.ADMIN)
   async getRiskDashboard() {
     return this.aiService.getRiskDashboard();
-  }
-  
-  @Get('detect-anomalies')
-  @Roles(UserRole.GOVERNMENT, UserRole.ADMIN)
-  async detectAnomalies() {
-    const fraudDetectionService = this.aiService['fraudDetectionService'];
-    const anomalies = await fraudDetectionService.detectAnomalies();
-    return { anomalies: anomalies, count: anomalies.length };
   }
 }

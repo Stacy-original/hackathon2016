@@ -6,7 +6,7 @@ export type DocumentRecordDocument = DocumentRecord & Document;
 export enum DocumentType {
   INVOICE = 'invoice',
   CONTRACT = 'contract',
-  RECEIPT = 'receipt',
+  RECEIPT = 'receipt',  // Add this
   REPORT = 'report',
   LAND_TITLE = 'land_title',
 }

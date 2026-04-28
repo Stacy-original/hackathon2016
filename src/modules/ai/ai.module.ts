@@ -1,3 +1,4 @@
+// modules/ai/ai.module.ts
 import { Module } from '@nestjs/common';
 import { MongooseModule } from '@nestjs/mongoose';
 import { AiController } from './ai.controller';
@@ -5,6 +6,7 @@ import { AiService } from './ai.service';
 import { FraudDetectionService } from './fraud-detection.service';
 import { Company, CompanySchema } from '../companies/schemas/company.schema';
 import { Subsidy, SubsidySchema } from '../subsidies/schemas/subsidy.schema';
+import { DocumentRecord, DocumentRecordSchema } from '../documents/schemas/document.schema';
 import { CompaniesModule } from '../companies/companies.module';
 
 @Module({
@@ -12,6 +14,7 @@ import { CompaniesModule } from '../companies/companies.module';
     MongooseModule.forFeature([
       { name: Company.name, schema: CompanySchema },
       { name: Subsidy.name, schema: SubsidySchema },
+      { name: DocumentRecord.name, schema: DocumentRecordSchema },
     ]),
     CompaniesModule,
   ],

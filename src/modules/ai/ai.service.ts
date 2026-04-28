@@ -1,11 +1,50 @@
-import { Injectable, Logger } from '@nestjs/common';
+// modules/ai/ai.service.ts
+import { Injectable, Logger, HttpException, HttpStatus } from '@nestjs/common';
 import { InjectModel } from '@nestjs/mongoose';
 import { Model } from 'mongoose';
+import { ConfigService } from '@nestjs/config';
+import axios from 'axios';
 import * as Tesseract from 'tesseract.js';
 import { Company, CompanyDocument } from '../companies/schemas/company.schema';
+import { Subsidy, SubsidyDocument } from '../subsidies/schemas/subsidy.schema';
+import { DocumentRecord, DocumentRecordDocument, VerificationStatus } from '../documents/schemas/document.schema';
+import { CompanyStatus, TrustLevel } from '../../common/interfaces/user.interface';
 import { FraudDetectionService } from './fraud-detection.service';
 import { CompaniesService } from '../companies/companies.service';
-import { CompanyStatus } from '../../common/interfaces/user.interface';
+
+export interface GeminiAuditResult {
+  vendor: string;
+  items: Array<{
+    name: string;
+    price: number;
+    is_suspicious: boolean;
+  }>;
+  analysis: {
+    stars: number;
+    trust_level: 'HIGH' | 'MEDIUM' | 'LOW';
+    verdict: string;
+    risk_flags: string[];
+  };
+}
+
+export interface ProcessedReceiptResult {
+  success: boolean;
+  receiptId: string;
+  extractedData: GeminiAuditResult;
+  trustScore: number;
+  trustLevel: string;
+  fraudScore: number;
+  isFraudulent: boolean;
+  recommendations: string[];
+  company?: {
+    id: string;
+    name: string;
+    bin: string;
+    trustScore: number;
+    status: string;
+  } | null;
+  createdAt: Date;
+}
 
 interface ExtractedData {
   companyName: string | null;
@@ -20,12 +59,354 @@ interface ExtractedData {
 @Injectable()
 export class AiService {
   private readonly logger = new Logger(AiService.name);
-  
+  private readonly geminiApiKey: string;
+  private readonly geminiModelName: string;
+  private readonly geminiApiUrl: string;
+
   constructor(
     @InjectModel(Company.name) private companyModel: Model<CompanyDocument>,
+    @InjectModel(Subsidy.name) private subsidyModel: Model<SubsidyDocument>,
+    @InjectModel(DocumentRecord.name) private documentModel: Model<DocumentRecordDocument>,
+    private configService: ConfigService,
     private fraudDetectionService: FraudDetectionService,
     private companiesService: CompaniesService,
-  ) {}
+  ) {
+    this.geminiApiKey = this.configService.get<string>('GEMINI_API_KEY') || '';
+    this.geminiModelName = this.configService.get<string>('GEMINI_MODEL_NAME', 'gemini-1.5-flash');
+    this.geminiApiUrl = `https://generativelanguage.googleapis.com/v1beta/models/${this.geminiModelName}:generateContent?key=${this.geminiApiKey}`;
+  }
+
+  // ============ GEMINI RECEIPT PROCESSING (NEW) ============
+  
+  async processReceiptWithGemini(
+    file: Express.Multer.File,
+    companyId?: string,
+  ): Promise<ProcessedReceiptResult> {
+    try {
+      // 1. Convert image to base64
+      const base64Image = file.buffer.toString('base64');
+      const mimeType = file.mimetype || 'image/jpeg';
+
+      // 2. Build prompt for Gemini
+      const prompt = this.buildReceiptAnalysisPrompt(companyId);
+
+      // 3. Call Gemini API
+      const geminiResult = await this.callGeminiAPI(prompt, base64Image, mimeType);
+      
+      // 4. Calculate fraud score based on Gemini analysis
+      const fraudScore = this.calculateFraudScore(geminiResult);
+      
+      // 5. Find or create company from vendor name
+      let company: CompanyDocument | null = null;
+      if (geminiResult.vendor && geminiResult.vendor !== 'Неизвестно') {
+        company = await this.findOrCreateCompany(geminiResult.vendor);
+      }
+      
+      // 6. Create document record in database
+      const documentRecord = await this.createDocumentRecord(
+        file,
+        geminiResult,
+        fraudScore,
+        companyId || (company ? company._id.toString() : undefined),
+      );
+      
+      // 7. Generate recommendations
+      const recommendations = this.generateRecommendations(geminiResult, fraudScore);
+      
+      // 8. Update company trust score if company exists
+      if (company) {
+        await this.updateCompanyWithReceiptData(company._id.toString(), geminiResult, fraudScore);
+      }
+
+      // 9. Return processed result
+      return {
+        success: true,
+        receiptId: documentRecord._id.toString(),
+        extractedData: geminiResult,
+        trustScore: geminiResult.analysis.stars * 20,
+        trustLevel: geminiResult.analysis.trust_level,
+        fraudScore: fraudScore,
+        isFraudulent: fraudScore > 50,
+        recommendations: recommendations,
+        company: company ? {
+          id: company._id.toString(),
+          name: company.name,
+          bin: company.bin,
+          trustScore: company.trustScore?.score || 50,
+          status: company.status,
+        } : null,
+        createdAt: new Date(),
+      };
+      
+    } catch (error) {
+      this.logger.error(`Failed to process receipt: ${error.message}`);
+      throw new HttpException(
+        `Failed to process receipt: ${error.message}`,
+        HttpStatus.INTERNAL_SERVER_ERROR,
+      );
+    }
+  }
+
+  private buildReceiptAnalysisPrompt(companyId?: string): string {
+    return `
+Ты — ИИ-аудитор системы мониторинга сельскохозяйственных субсидий в Казахстане.
+
+ЗАДАЧА:
+Проанализируй чек/накладную на фото и предоставь структурированный JSON ответ.
+
+ЧТО НУЖНО СДЕЛАТЬ:
+1. Извлеки название компании-продавца или поставщика
+2. Извлеки все товары/услуги с ценами (в тенге)
+3. Отметь подозрительные позиции (цены выше рыночных на 30%+)
+4. Выставь Trust Factor от 0 до 5 звезд:
+   - 5 звезд: Все цены рыночные, чек легальный
+   - 4 звезды: Небольшие отклонения от рыночных цен
+   - 3 звезды: Есть подозрительные позиции
+   - 2 звезды: Цены завышены в 2-3 раза
+   - 1 звезда: Цены завышены в 3-5 раз
+   - 0 звезд: Явные признаки мошенничества
+
+РЫНОЧНЫЕ ЦЕНЫ (КЗ тенге):
+- Удобрения: 180-250 тг/кг
+- Семена пшеницы: 120-150 тг/кг
+- Семена кукурузы: 250-300 тг/кг
+- Дизельное топливо: 280-320 тг/л
+- Гербициды: 5000-15000 тг/л
+- Техника (тракторы): 8M-15M тг
+- Запчасти: 5000-50000 тг
+
+ВЕРНИ ТОЛЬКО JSON В ЭТОМ ФОРМАТЕ (без других комментариев):
+{
+  "vendor": "Название компании из чека",
+  "items": [
+    {"name": "Название товара", "price": 0, "is_suspicious": false}
+  ],
+  "analysis": {
+    "stars": 0,
+    "trust_level": "LOW",
+    "verdict": "Краткое заключение на русском",
+    "risk_flags": ["флаг1", "флаг2"]
+  }
+}
+`;
+  }
+
+  private async callGeminiAPI(prompt: string, base64Image: string, mimeType: string): Promise<GeminiAuditResult> {
+    try {
+      const payload = {
+        contents: [
+          {
+            parts: [
+              { text: prompt },
+              {
+                inline_data: {
+                  mime_type: mimeType,
+                  data: base64Image,
+                },
+              },
+            ],
+          },
+        ],
+        generationConfig: {
+          temperature: 0.1,
+          topK: 1,
+          topP: 0.8,
+          maxOutputTokens: 2048,
+        },
+      };
+
+      const response = await axios.post(this.geminiApiUrl, payload, {
+        timeout: 60000,
+        headers: {
+          'Content-Type': 'application/json',
+        },
+      });
+
+      if (response.status !== 200) {
+        throw new Error(`Gemini API returned status ${response.status}`);
+      }
+
+      const rawText = response.data.candidates?.[0]?.content?.parts?.[0]?.text;
+      if (!rawText) {
+        throw new Error('No text response from Gemini');
+      }
+
+      let cleanJson = rawText.trim();
+      cleanJson = cleanJson.replace(/```json/g, '');
+      cleanJson = cleanJson.replace(/```/g, '');
+      
+      const result = JSON.parse(cleanJson) as GeminiAuditResult;
+      
+      if (!result.vendor) result.vendor = 'Неизвестно';
+      if (!result.items) result.items = [];
+      if (!result.analysis) {
+        result.analysis = {
+          stars: 0,
+          trust_level: 'LOW',
+          verdict: 'Не удалось проанализировать чек',
+          risk_flags: ['Ошибка распознавания'],
+        };
+      }
+      
+      return result;
+      
+    } catch (error) {
+      this.logger.error(`Gemini API call failed: ${error.message}`);
+      if (axios.isAxiosError(error) && error.response) {
+        this.logger.error(`Gemini response: ${JSON.stringify(error.response.data)}`);
+      }
+      throw new Error(`Gemini API error: ${error.message}`);
+    }
+  }
+
+  private calculateFraudScore(geminiResult: GeminiAuditResult): number {
+    let score = 0;
+    
+    const starsToScore = (5 - geminiResult.analysis.stars) * 20;
+    score += starsToScore;
+    
+    const suspiciousCount = geminiResult.items.filter(i => i.is_suspicious).length;
+    if (suspiciousCount > 0) {
+      score += Math.min(30, suspiciousCount * 10);
+    }
+    
+    if (geminiResult.analysis.risk_flags) {
+      score += Math.min(20, geminiResult.analysis.risk_flags.length * 5);
+    }
+    
+    if (geminiResult.analysis.trust_level === 'LOW') score += 15;
+    if (geminiResult.analysis.trust_level === 'MEDIUM') score += 5;
+    
+    return Math.min(100, Math.max(0, score));
+  }
+
+  private async findOrCreateCompany(vendorName: string): Promise<CompanyDocument | null> {
+    try {
+      let company = await this.companyModel.findOne({ 
+        name: { $regex: new RegExp(vendorName, 'i') } 
+      }).exec();
+      
+      if (!company) {
+        company = new this.companyModel({
+          bin: `TEMP_${Date.now()}`,
+          name: vendorName,
+          status: CompanyStatus.PENDING,
+          trustScore: {
+            score: 50,
+            level: 'medium',
+            factors: {
+              subsidyCompliance: 50,
+              documentQuality: 50,
+              landUsage: 50,
+              reportingConsistency: 50,
+              anomalyDetection: 50,
+            },
+            lastCalculated: new Date(),
+          },
+          registeredAt: new Date(),
+        });
+        await company.save();
+        this.logger.log(`Created new company: ${vendorName}`);
+      }
+      
+      return company;
+    } catch (error) {
+      this.logger.error(`Failed to find/create company: ${error.message}`);
+      return null;
+    }
+  }
+
+  private async createDocumentRecord(
+    file: Express.Multer.File,
+    geminiResult: GeminiAuditResult,
+    fraudScore: number,
+    companyId?: string,
+  ): Promise<DocumentRecordDocument> {
+    const document = new this.documentModel({
+      companyId: companyId || null,
+      subsidyId: 'direct_scan',
+      type: 'receipt',
+      documentUrl: 'memory_upload',
+      fileName: file.originalname,
+      fileSize: file.size,
+      extractedData: {
+        vendor: geminiResult.vendor,
+        items: geminiResult.items,
+        totalAmount: geminiResult.items.reduce((sum, item) => sum + item.price, 0),
+      },
+      fraudScore: fraudScore,
+      verificationStatus: fraudScore > 70 
+        ? VerificationStatus.SUSPICIOUS 
+        : (fraudScore > 40 ? VerificationStatus.PENDING : VerificationStatus.VERIFIED),
+      issues: geminiResult.analysis.risk_flags,
+      verifiedAt: new Date(),
+    });
+    
+    return document.save();
+  }
+
+  private generateRecommendations(geminiResult: GeminiAuditResult, fraudScore: number): string[] {
+    const recommendations: string[] = [];
+    
+    if (fraudScore > 70) {
+      recommendations.push('Требуется немедленная проверка компании');
+      recommendations.push('Рекомендуется приостановить выплаты по субсидиям');
+      recommendations.push('Направить уведомление в финансовую полицию');
+    } else if (fraudScore > 40) {
+      recommendations.push('Провести дополнительную проверку документов');
+      recommendations.push('Запросить оригиналы счет-фактур');
+      recommendations.push('Внести компанию в список повышенного контроля');
+    } else if (geminiResult.analysis.stars < 3) {
+      recommendations.push('Проверить цены на предмет завышения');
+      recommendations.push('Запросить прайс-листы поставщика');
+    } else {
+      recommendations.push('Документ прошел проверку - можно одобрить');
+      recommendations.push('Продолжить стандартный мониторинг');
+    }
+    
+    if (geminiResult.analysis.risk_flags?.length > 0) {
+      for (const flag of geminiResult.analysis.risk_flags.slice(0, 2)) {
+        recommendations.push(`Внимание: ${flag}`);
+      }
+    }
+    
+    return recommendations;
+  }
+
+  private async updateCompanyWithReceiptData(
+    companyId: string,
+    geminiResult: GeminiAuditResult,
+    fraudScore: number,
+  ): Promise<void> {
+    try {
+      const company = await this.companyModel.findById(companyId);
+      if (!company) return;
+      
+      const currentScore = company.trustScore?.score || 50;
+      const newScore = Math.round((currentScore + geminiResult.analysis.stars * 20) / 2);
+      
+      let level = 'low';
+      if (newScore >= 70) level = 'high';
+      else if (newScore >= 40) level = 'medium';
+      
+      await this.companyModel.findByIdAndUpdate(companyId, {
+        $set: {
+          'trustScore.score': newScore,
+          'trustScore.level': level,
+          'trustScore.lastCalculated': new Date(),
+          lastAuditDate: new Date(),
+        },
+        $inc: { totalSubsidiesReceived: geminiResult.items.reduce((sum, i) => sum + i.price, 0) },
+      });
+      
+      this.logger.log(`Updated company ${companyId} trust score to ${newScore}`);
+      
+    } catch (error) {
+      this.logger.error(`Failed to update company: ${error.message}`);
+    }
+  }
+
+  // ============ ORIGINAL METHODS (KEEP THESE) ============
   
   async scanDocument(imageBuffer: Buffer): Promise<any> {
     try {
@@ -155,11 +536,11 @@ export class AiService {
       trustScore: trustScore,
       anomalies: companyAnomalies,
       auditDate: new Date(),
-      recommendations: this.generateRecommendations(trustScore, companyAnomalies),
+      recommendations: this.generateAuditRecommendations(trustScore, companyAnomalies),
     };
   }
   
-  private generateRecommendations(trustScore: any, anomalies: any[]): string[] {
+  private generateAuditRecommendations(trustScore: any, anomalies: any[]): string[] {
     const recommendations: string[] = [];
     
     if (trustScore && trustScore.score < 40) {
