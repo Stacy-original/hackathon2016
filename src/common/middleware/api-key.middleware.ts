@@ -27,14 +27,16 @@ export class ApiKeyMiddleware implements NestMiddleware {
       throw new UnauthorizedException('Invalid API key');
     }
     
-    // Set role based on API key type
+    // Set role based on API key type - FIX: Use user object instead of userRole
+    let role = 0; // USER default
     if (apiKey === this.configService.get('ADMIN_API_KEY')) {
-      req['userRole'] = 2; // ADMIN
+      role = 2; // ADMIN
     } else if (apiKey === this.configService.get('GOVERNMENT_API_KEY')) {
-      req['userRole'] = 1; // GOVERNMENT
-    } else {
-      req['userRole'] = 0; // USER
+      role = 1; // GOVERNMENT
     }
+    
+    // Attach user object to request (what RolesGuard expects)
+    req['user'] = { role: role };
     
     next();
   }

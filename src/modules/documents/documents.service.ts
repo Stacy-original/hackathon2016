@@ -1,4 +1,4 @@
-import { Injectable } from '@nestjs/common';
+import { Injectable, NotFoundException } from '@nestjs/common';
 import { InjectModel } from '@nestjs/mongoose';
 import { Model } from 'mongoose';
 import { DocumentRecord, DocumentRecordDocument, VerificationStatus } from './schemas/document.schema';
@@ -22,6 +22,7 @@ export class DocumentsService {
     const updateData: any = {
       extractedData: scanResult.extractedData,
       fraudScore: scanResult.fraudScore,
+      verifiedAt: new Date(),
     };
     
     if (scanResult.fraudScore > 70) {
@@ -40,6 +41,10 @@ export class DocumentsService {
       { new: true }
     );
     
+    if (!document) {
+      throw new NotFoundException('Document not found');
+    }
+    
     return {
       document,
       scanResult,
@@ -54,5 +59,17 @@ export class DocumentsService {
     return this.documentModel.find({
       verificationStatus: VerificationStatus.SUSPICIOUS,
     }).sort({ createdAt: -1 }).exec();
+  }
+
+  async getAllDocuments(): Promise<DocumentRecord[]> {
+    return this.documentModel.find().sort({ createdAt: -1 }).exec();
+  }
+
+  async findById(id: string): Promise<DocumentRecord | null> {
+    const document = await this.documentModel.findById(id).exec();
+    if (!document) {
+      throw new NotFoundException('Document not found');
+    }
+    return document;
   }
 }
