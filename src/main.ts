@@ -41,8 +41,9 @@ async function bootstrap() {
   // Global prefix
   app.setGlobalPrefix('api');
   
+  // USE THIS: Always use process.env.PORT (Render sets this automatically)
   const port = process.env.PORT || 3001;
-  await app.listen(port);
+  await app.listen(port, '0.0.0.0'); // Important: bind to 0.0.0.0 for Render
   
   console.log(`🚀 AgroAudit AI Backend running on: http://localhost:${port}`);
   console.log(`📊 Environment: ${process.env.NODE_ENV || 'development'}`);
