@@ -1,9 +1,25 @@
 export enum UserRole {
   USER = 0,
-  GOVERNMENT = 1,
-  ADMIN = 2,
+  EDITOR = 1,
+  GOVERNMENT = 1,  // Keep as alias for EDITOR
+  ADMIN = 2
 }
 
+export interface User {
+  id: string;
+  name: string;
+  email: string;
+  photo?: string;
+  phone?: string;
+  role: UserRole;
+  isActive: boolean;
+  createdAt: Date;
+  updatedAt: Date;
+  lastLogin: Date;
+  lastActivity: Date;
+}
+
+// Rest of your interfaces remain the same...
 export enum CompanyStatus {
   PENDING = 'pending',
   VERIFIED = 'verified',

@@ -7,7 +7,7 @@ export type UserDocument = User & Document;
 @Schema({ timestamps: true })
 export class User {
   @Prop({ required: true, unique: true })
-  userId: string;
+  id: string;
 
   @Prop({ required: true })
   name: string;
@@ -21,7 +21,7 @@ export class User {
   @Prop()
   photo: string;
 
-  @Prop({ required: true, type: Number, enum: UserRole, default: UserRole.USER })
+  @Prop({ required: true, type: Number, enum: Object.values(UserRole).filter(v => typeof v === 'number'), default: UserRole.USER })
   role: UserRole;
 
   @Prop({ type: Boolean, default: true })
@@ -56,7 +56,8 @@ export class User {
 
 export const UserSchema = SchemaFactory.createForClass(User);
 
-UserSchema.index({ userId: 1 });
+// Indexes
+UserSchema.index({ id: 1 });
 UserSchema.index({ email: 1 });
 UserSchema.index({ companyId: 1 });
 UserSchema.index({ role: 1 });
