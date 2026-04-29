@@ -18,6 +18,7 @@ export class User {
   @Prop()
   phone: string;
 
+  @Prop()
   photo: string;
 
   @Prop({ required: true, type: Number, enum: UserRole, default: UserRole.USER })

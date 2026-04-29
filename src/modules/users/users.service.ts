@@ -13,11 +13,14 @@ export class UsersService {
   ) {}
   
   async create(userData: Partial<User>): Promise<User> {
+    this.logger.log(`Creating user with data:`, userData);
+    
     const existingUser = await this.userModel.findOne({
       $or: [{ email: userData.email }, { userId: userData.userId }],
     });
     
     if (existingUser) {
+      this.logger.warn(`User already exists with email: ${userData.email}`);
       throw new ConflictException('User already exists');
     }
     
@@ -35,16 +38,18 @@ export class UsersService {
     });
     
     const savedUser = await user.save();
-    this.logger.log(`User created: ${savedUser.email} (${savedUser.userId})`);
+    this.logger.log(`User created: ${savedUser.email} (${savedUser.userId}) with role ${savedUser.role}`);
     
     return savedUser;
   }
   
   async findByEmail(email: string): Promise<User | null> {
+    this.logger.debug(`Finding user by email: ${email}`);
     return this.userModel.findOne({ email }).exec();
   }
   
   async findById(userId: string): Promise<User | null> {
+    this.logger.debug(`Finding user by ID: ${userId}`);
     return this.userModel.findOne({ userId }).exec();
   }
   
@@ -57,6 +62,8 @@ export class UsersService {
   }
   
   async update(userId: string, updateData: Partial<User>): Promise<User> {
+    this.logger.log(`Updating user ${userId} with data:`, updateData);
+    
     const user = await this.userModel.findOneAndUpdate(
       { userId },
       { ...updateData, updatedAt: new Date() },
@@ -64,6 +71,7 @@ export class UsersService {
     );
     
     if (!user) {
+      this.logger.error(`User with ID ${userId} not found for update`);
       throw new NotFoundException(`User with ID ${userId} not found`);
     }
     

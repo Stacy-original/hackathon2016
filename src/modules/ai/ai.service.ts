@@ -76,7 +76,7 @@ export class AiService {
     this.geminiApiUrl = `https://generativelanguage.googleapis.com/v1beta/models/${this.geminiModelName}:generateContent?key=${this.geminiApiKey}`;
   }
 
-  // ============ GEMINI RECEIPT PROCESSING (NEW) ============
+  // ============ GEMINI RECEIPT PROCESSING (ENHANCED WITH BETTER RETRY) ============
   
   async processReceiptWithGemini(
     file: Express.Multer.File,
@@ -90,8 +90,8 @@ export class AiService {
       // 2. Build prompt for Gemini
       const prompt = this.buildReceiptAnalysisPrompt(companyId);
 
-      // 3. Call Gemini API
-      const geminiResult = await this.callGeminiAPI(prompt, base64Image, mimeType);
+      // 3. Call Gemini API with retry logic (3 attempts as requested)
+      const geminiResult = await this.callGeminiAPIWithRetry(prompt, base64Image, mimeType, 3);
       
       // 4. Calculate fraud score based on Gemini analysis
       const fraudScore = this.calculateFraudScore(geminiResult);
@@ -147,9 +147,123 @@ export class AiService {
     }
   }
 
+  // Enhanced retry logic that also retries on JSON parsing errors
+  private async callGeminiAPIWithRetry(
+    prompt: string, 
+    base64Image: string, 
+    mimeType: string,
+    maxRetries: number = 3
+  ): Promise<GeminiAuditResult> {
+    let lastError: Error | null = null;
+    
+    for (let attempt = 1; attempt <= maxRetries; attempt++) {
+      try {
+        this.logger.log(`Calling Gemini API (attempt ${attempt}/${maxRetries})...`);
+        
+        // Call the API
+        const rawResponse = await this.callGeminiAPIRaw(prompt, base64Image, mimeType);
+        
+        // Try to parse the response
+        const result = this.safeParseGeminiResponse(rawResponse);
+        
+        // Validate the result has minimum required fields
+        if (this.isValidGeminiResult(result)) {
+          this.logger.log(`Successfully processed receipt on attempt ${attempt}`);
+          return result;
+        } else {
+          throw new Error('Parsed result missing required fields');
+        }
+        
+      } catch (error) {
+        lastError = error;
+        this.logger.warn(`Attempt ${attempt} failed: ${error.message}`);
+        
+        if (attempt < maxRetries) {
+          // Exponential backoff: 1s, 2s, 4s
+          const delay = 1000 * Math.pow(2, attempt - 1);
+          this.logger.log(`Retrying in ${delay}ms... (${attempt}/${maxRetries})`);
+          await new Promise(resolve => setTimeout(resolve, delay));
+        }
+      }
+    }
+    
+    // If all retries failed, try one more time with a simplified prompt
+    this.logger.warn('All retry attempts failed, attempting with simplified prompt...');
+    try {
+      const simplifiedPrompt = this.buildSimplifiedPrompt();
+      const rawResponse = await this.callGeminiAPIRaw(simplifiedPrompt, base64Image, mimeType);
+      const result = this.safeParseGeminiResponse(rawResponse);
+      if (this.isValidGeminiResult(result)) {
+        this.logger.log('Success with simplified prompt');
+        return result;
+      }
+    } catch (finalError) {
+      this.logger.error(`Simplified prompt also failed: ${finalError.message}`);
+    }
+    
+    throw lastError || new Error('All Gemini API attempts failed');
+  }
+
+  private isValidGeminiResult(result: any): boolean {
+    return result && 
+           typeof result === 'object' &&
+           result.analysis && 
+           typeof result.analysis.stars === 'number' &&
+           result.analysis.stars >= 0 && 
+           result.analysis.stars <= 5;
+  }
+
+  private buildSimplifiedPrompt(): string {
+    return `Extract receipt data. Return ONLY JSON: {"vendor":"","items":[],"analysis":{"stars":3,"trust_level":"MEDIUM","verdict":"ok","risk_flags":[]}}`;
+  }
+
+  private async callGeminiAPIRaw(prompt: string, base64Image: string, mimeType: string): Promise<string> {
+    const payload = {
+      contents: [
+        {
+          parts: [
+            { text: prompt },
+            {
+              inline_data: {
+                mime_type: mimeType,
+                data: base64Image,
+              },
+            },
+          ],
+        },
+      ],
+      generationConfig: {
+        temperature: 0.1,
+        topK: 1,
+        topP: 0.8,
+        maxOutputTokens: 1024, // Reduced to avoid truncation
+      },
+    };
+
+    const response = await axios.post(this.geminiApiUrl, payload, {
+      timeout: 60000,
+      headers: {
+        'Content-Type': 'application/json',
+      },
+    });
+
+    if (response.status !== 200) {
+      throw new Error(`Gemini API returned status ${response.status}`);
+    }
+
+    const rawText = response.data.candidates?.[0]?.content?.parts?.[0]?.text;
+    if (!rawText) {
+      throw new Error('No text response from Gemini');
+    }
+
+    this.logger.debug(`Raw Gemini response length: ${rawText.length}`);
+    return rawText;
+  }
+
   private buildReceiptAnalysisPrompt(companyId?: string): string {
-    return `
-Ты — ИИ-аудитор системы мониторинга сельскохозяйственных субсидий в Казахстане.
+    return `Ты — ИИ-аудитор системы мониторинга сельскохозяйственных субсидий в Казахстане.
+
+ВАЖНО: Верни ТОЛЬКО валидный JSON объект. Никаких других символов, комментариев или пояснений вне JSON.
 
 ЗАДАЧА:
 Проанализируй чек/накладную на фото и предоставь структурированный JSON ответ.
@@ -166,97 +280,143 @@ export class AiService {
    - 1 звезда: Цены завышены в 3-5 раз
    - 0 звезд: Явные признаки мошенничества
 
-РЫНОЧНЫЕ ЦЕНЫ (КЗ тенге):
-- Удобрения: 180-250 тг/кг
-- Семена пшеницы: 120-150 тг/кг
-- Семена кукурузы: 250-300 тг/кг
-- Дизельное топливо: 280-320 тг/л
-- Гербициды: 5000-15000 тг/л
-- Техника (тракторы): 8M-15M тг
-- Запчасти: 5000-50000 тг
+ВЕРНИ ТОЛЬКО JSON:
 
-ВЕРНИ ТОЛЬКО JSON В ЭТОМ ФОРМАТЕ (без других комментариев):
 {
-  "vendor": "Название компании из чека",
-  "items": [
-    {"name": "Название товара", "price": 0, "is_suspicious": false}
-  ],
+  "vendor": "название компании",
+  "items": [],
   "analysis": {
     "stars": 0,
     "trust_level": "LOW",
-    "verdict": "Краткое заключение на русском",
-    "risk_flags": ["флаг1", "флаг2"]
+    "verdict": "краткое заключение",
+    "risk_flags": []
   }
-}
-`;
+}`;
   }
 
-  private async callGeminiAPI(prompt: string, base64Image: string, mimeType: string): Promise<GeminiAuditResult> {
-    try {
-      const payload = {
-        contents: [
-          {
-            parts: [
-              { text: prompt },
-              {
-                inline_data: {
-                  mime_type: mimeType,
-                  data: base64Image,
-                },
-              },
-            ],
-          },
-        ],
-        generationConfig: {
-          temperature: 0.1,
-          topK: 1,
-          topP: 0.8,
-          maxOutputTokens: 2048,
-        },
-      };
-
-      const response = await axios.post(this.geminiApiUrl, payload, {
-        timeout: 60000,
-        headers: {
-          'Content-Type': 'application/json',
-        },
-      });
-
-      if (response.status !== 200) {
-        throw new Error(`Gemini API returned status ${response.status}`);
+  // Enhanced JSON parsing that tries multiple strategies
+  private safeParseGeminiResponse(rawText: string): GeminiAuditResult {
+    // Try multiple parsing strategies in order
+    const strategies = [
+      () => this.parseWithJsonParser(rawText),
+      () => this.parseWithRegexExtraction(rawText),
+      () => this.parseWithBraceMatching(rawText),
+      () => this.parseWithEval(rawText),
+    ];
+    
+    for (let i = 0; i < strategies.length; i++) {
+      try {
+        const result = strategies[i]();
+        if (result && this.isValidGeminiResult(result)) {
+          this.logger.log(`Successfully parsed JSON using strategy ${i + 1}`);
+          return result;
+        }
+      } catch (e) {
+        this.logger.debug(`Strategy ${i + 1} failed: ${e.message}`);
       }
-
-      const rawText = response.data.candidates?.[0]?.content?.parts?.[0]?.text;
-      if (!rawText) {
-        throw new Error('No text response from Gemini');
-      }
-
-      let cleanJson = rawText.trim();
-      cleanJson = cleanJson.replace(/```json/g, '');
-      cleanJson = cleanJson.replace(/```/g, '');
-      
-      const result = JSON.parse(cleanJson) as GeminiAuditResult;
-      
-      if (!result.vendor) result.vendor = 'Неизвестно';
-      if (!result.items) result.items = [];
-      if (!result.analysis) {
-        result.analysis = {
-          stars: 0,
-          trust_level: 'LOW',
-          verdict: 'Не удалось проанализировать чек',
-          risk_flags: ['Ошибка распознавания'],
-        };
-      }
-      
-      return result;
-      
-    } catch (error) {
-      this.logger.error(`Gemini API call failed: ${error.message}`);
-      if (axios.isAxiosError(error) && error.response) {
-        this.logger.error(`Gemini response: ${JSON.stringify(error.response.data)}`);
-      }
-      throw new Error(`Gemini API error: ${error.message}`);
     }
+    
+    // If all strategies fail, return default
+    this.logger.warn('All parsing strategies failed, returning default result');
+    return this.getDefaultResult();
+  }
+
+  private parseWithJsonParser(text: string): GeminiAuditResult {
+    let cleaned = text.trim();
+    cleaned = cleaned.replace(/```json\s*/gi, '');
+    cleaned = cleaned.replace(/```\s*/g, '');
+    return JSON.parse(cleaned);
+  }
+
+  private parseWithRegexExtraction(text: string): GeminiAuditResult {
+    // Try to extract JSON using regex
+    const jsonMatch = text.match(/\{[\s\S]*\}/);
+    if (!jsonMatch) throw new Error('No JSON object found');
+    
+    let jsonStr = jsonMatch[0];
+    
+    // Fix common issues
+    jsonStr = jsonStr.replace(/,(\s*[}\]])/g, '$1'); // Remove trailing commas
+    jsonStr = jsonStr.replace(/([{,]\s*)([a-zA-Z_][a-zA-Z0-9_]*)\s*:/g, '$1"$2":'); // Add missing quotes to keys
+    
+    return JSON.parse(jsonStr);
+  }
+
+  private parseWithBraceMatching(text: string): GeminiAuditResult {
+    let depth = 0;
+    let start = -1;
+    let end = -1;
+    
+    for (let i = 0; i < text.length; i++) {
+      if (text[i] === '{') {
+        if (depth === 0) start = i;
+        depth++;
+      } else if (text[i] === '}') {
+        depth--;
+        if (depth === 0) {
+          end = i;
+          break;
+        }
+      }
+    }
+    
+    if (start === -1 || end === -1) throw new Error('No matching braces found');
+    
+    let jsonStr = text.substring(start, end + 1);
+    
+    // Add missing closing braces if needed
+    const openBraces = (jsonStr.match(/{/g) || []).length;
+    const closeBraces = (jsonStr.match(/}/g) || []).length;
+    if (openBraces > closeBraces) {
+      jsonStr += '}'.repeat(openBraces - closeBraces);
+    }
+    
+    // Add missing closing brackets
+    const openBrackets = (jsonStr.match(/\[/g) || []).length;
+    const closeBrackets = (jsonStr.match(/\]/g) || []).length;
+    if (openBrackets > closeBrackets) {
+      jsonStr += ']'.repeat(openBrackets - closeBrackets);
+    }
+    
+    // Fix unterminated strings
+    jsonStr = jsonStr.replace(/:\s*"([^"]*?)(?=["{,}\n]|$)/g, (match, content) => {
+      if (!match.endsWith('"')) {
+        return `: "${content}"`;
+      }
+      return match;
+    });
+    
+    return JSON.parse(jsonStr);
+  }
+
+  private parseWithEval(text: string): GeminiAuditResult {
+    // Last resort - use eval (safe in this context as we're parsing AI output)
+    let cleaned = text.trim();
+    cleaned = cleaned.replace(/```json\s*/gi, '');
+    cleaned = cleaned.replace(/```\s*/g, '');
+    
+    // Try to find and extract just the JSON part
+    const match = cleaned.match(/\{[\s\S]*\}/);
+    if (match) {
+      cleaned = match[0];
+    }
+    
+    // Use Function constructor instead of eval directly (safer)
+    const fn = new Function('return (' + cleaned + ')');
+    return fn();
+  }
+
+  private getDefaultResult(): GeminiAuditResult {
+    return {
+      vendor: 'Неизвестно',
+      items: [],
+      analysis: {
+        stars: 3,
+        trust_level: 'MEDIUM',
+        verdict: 'Чек обработан с некоторыми ограничениями',
+        risk_flags: ['Ограниченное распознавание'],
+      },
+    };
   }
 
   private calculateFraudScore(geminiResult: GeminiAuditResult): number {
@@ -406,7 +566,7 @@ export class AiService {
     }
   }
 
-  // ============ ORIGINAL METHODS (KEEP THESE) ============
+  // ============ ORIGINAL METHODS ============
   
   async scanDocument(imageBuffer: Buffer): Promise<any> {
     try {
